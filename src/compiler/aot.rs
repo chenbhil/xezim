@@ -1014,7 +1014,15 @@ fn emit_insn_rust(
         }
         BlockingAssignBitDyn(sig, idx_r, val) => {
             let sig = sref(*sig);
-            let _ = writeln!(w, "(br().blk_range)(sim, {sig}, r{idx_r}v, r{idx_r}v, r{val}v, r{val}x);");
+            // §11.5.1: an x/z index modifies no bits. The x plane never
+            // reached the bridge and the value plane has x bits masked to
+            // zero, so an unknown index arrived as bit 0. Hand the bridge a
+            // deliberately out-of-range index instead; it already drops those.
+            let _ = writeln!(
+                w,
+                "let bi{idx_r} = if r{idx_r}x != 0 {{ u64::MAX }} else {{ r{idx_r}v }};\n\
+                 (br().blk_range)(sim, {sig}, bi{idx_r}, bi{idx_r}, r{val}v, r{val}x);"
+            );
         }
         NbaAssignConst(sig, v, width) => {
             let sig = sref(*sig);
@@ -1037,7 +1045,12 @@ fn emit_insn_rust(
         }
         NbaAssignBitDyn(sig, idx_r, val) => {
             let sig = sref(*sig);
-            let _ = writeln!(w, "(br().nba_bit)(sim, {sig}, r{idx_r}v, r{val}v, r{val}x);");
+            // §11.5.1, as for the blocking form above.
+            let _ = writeln!(
+                w,
+                "let bi{idx_r} = if r{idx_r}x != 0 {{ u64::MAX }} else {{ r{idx_r}v }};\n\
+                 (br().nba_bit)(sim, {sig}, bi{idx_r}, r{val}v, r{val}x);"
+            );
         }
         LoadArrayElem(d, arr, idx_reg) => {
             let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {

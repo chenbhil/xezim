@@ -2994,6 +2994,24 @@ fn bytecode_array_elem_width(
         .max(1)
 }
 
+/// §11.5.1: the effective index of a DYNAMIC bit-select. `None` when the index
+/// contains x or z, in which case a WRITE must be discarded ("no bits shall be
+/// modified") and a read yields x.
+///
+/// `Value::to_u64` masks x bits to ZERO and returns `Some(0)` rather than
+/// `None`, so it cannot answer this question. Every dynamic bit-store used
+/// `to_u64().unwrap_or(0)` and therefore wrote BIT 0 whenever the index was
+/// unknown. Out-of-range indices need no help here: `Value::set_bit` already
+/// drops them. Same defect, and same fix, as the `LoadArrayElem` x-index
+/// sentinel on the read side.
+#[inline]
+fn dyn_bit_index(v: &Value) -> Option<usize> {
+    if v.has_xz() {
+        return None;
+    }
+    Some(v.to_u64().unwrap_or(0) as usize)
+}
+
 fn resolve_bytecode_array_elem(
     array: &super::bytecode::ArrayOperand,
     idx: i64,
@@ -22990,23 +23008,25 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out[i].value = new_val;
-                    } else {
-                        let cur = &signal_table[*sig_id];
-                        if cur.get_bit(idx) != bit {
-                            let mut new_val = cur.clone();
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                        if let Some(i) = existing {
+                            let mut new_val = nba_out[i].value.clone();
                             new_val.set_bit(idx, bit);
-                            nba_out.push(NbaFast {
-                                signal_id: *sig_id,
-                                value: new_val,
-                                block_index,
-                            });
+                            nba_out[i].value = new_val;
+                        } else {
+                            let cur = &signal_table[*sig_id];
+                            if cur.get_bit(idx) != bit {
+                                let mut new_val = cur.clone();
+                                new_val.set_bit(idx, bit);
+                                nba_out.push(NbaFast {
+                                    signal_id: *sig_id,
+                                    value: new_val,
+                                    block_index,
+                                });
+                            }
                         }
                     }
                 }
@@ -23690,13 +23710,15 @@ impl Simulator {
                 }
                 Insn::BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    if view[*sig_id].get_bit(idx) != bit {
-                        let mut new_val = view[*sig_id].clone();
-                        new_val.set_bit(idx, bit);
-                        view[*sig_id] = new_val;
-                        dirtied.push(*sig_id as u32);
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        if view[*sig_id].get_bit(idx) != bit {
+                            let mut new_val = view[*sig_id].clone();
+                            new_val.set_bit(idx, bit);
+                            view[*sig_id] = new_val;
+                            dirtied.push(*sig_id as u32);
+                        }
                     }
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
@@ -23838,21 +23860,23 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out[i].value = new_val;
-                    } else if view[*sig_id].get_bit(idx) != bit {
-                        let mut new_val = view[*sig_id].clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out.push(NbaFast {
-                            signal_id: *sig_id,
-                            value: new_val,
-                            block_index,
-                        });
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                        if let Some(i) = existing {
+                            let mut new_val = nba_out[i].value.clone();
+                            new_val.set_bit(idx, bit);
+                            nba_out[i].value = new_val;
+                        } else if view[*sig_id].get_bit(idx) != bit {
+                            let mut new_val = view[*sig_id].clone();
+                            new_val.set_bit(idx, bit);
+                            nba_out.push(NbaFast {
+                                signal_id: *sig_id,
+                                value: new_val,
+                                block_index,
+                            });
+                        }
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -25077,25 +25101,27 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                    let id = *sig_id;
-                    if let Some(i) = self.nba_fast_index.get(id) {
-                        self.nba_fast[i].value.set_bit(idx, bit);
-                    } else {
-                        // Single-bit elision: if the bit is already what
-                        // we're about to write, skip the queue push.
-                        if self.signal_table[id].get_bit(idx) == bit {
-                            self.prof_nba_elided += 1;
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
+                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                        let id = *sig_id;
+                        if let Some(i) = self.nba_fast_index.get(id) {
+                            self.nba_fast[i].value.set_bit(idx, bit);
                         } else {
-                            let mut new_val = self.signal_table[id].clone();
-                            new_val.set_bit(idx, bit);
-                            self.nba_fast_index.insert(id, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: id,
-                                value: new_val,
-                            });
+                            // Single-bit elision: if the bit is already what
+                            // we're about to write, skip the queue push.
+                            if self.signal_table[id].get_bit(idx) == bit {
+                                self.prof_nba_elided += 1;
+                            } else {
+                                let mut new_val = self.signal_table[id].clone();
+                                new_val.set_bit(idx, bit);
+                                self.nba_fast_index.insert(id, self.nba_fast.len());
+                                self.nba_fast.push(NbaFast {
+                                    block_index: 0,
+                                    signal_id: id,
+                                    value: new_val,
+                                });
+                            }
                         }
                     }
                 }
@@ -25221,22 +25247,26 @@ impl Simulator {
                     // this dominated allocator + memcpy time. Now: read
                     // current bit, skip the write if it matches; otherwise
                     // set in-place and mark dirty.
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                    let id = *sig_id;
-                    if idx < self.signal_widths[id] as usize {
-                        let cur = self.signal_table[id].get_bit(idx);
-                        if cur != bit {
-                            self.signal_table[id].set_bit(idx, bit);
-                            self.sync_mirror(id);
-                            self.signal_table[id].is_signed = self.signal_signed[id];
-                            if !self.dirty_signals[id] {
-                                self.dirty_signals[id] = true;
-                                self.dirty_list.push(id);
+                    // §11.5.1: an x/z index modifies no bits. `to_u64` masks
+                    // x bits to zero, so this cannot be folded into the range
+                    // check below -- an unknown index looked like bit 0.
+                    if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
+                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                        let id = *sig_id;
+                        if idx < self.signal_widths[id] as usize {
+                            let cur = self.signal_table[id].get_bit(idx);
+                            if cur != bit {
+                                self.signal_table[id].set_bit(idx, bit);
+                                self.sync_mirror(id);
+                                self.signal_table[id].is_signed = self.signal_signed[id];
+                                if !self.dirty_signals[id] {
+                                    self.dirty_signals[id] = true;
+                                    self.dirty_list.push(id);
+                                }
+                                self.dirty_any = true;
+                                self.table_modified = true;
+                                self.after_signal_write(id);
                             }
-                            self.dirty_any = true;
-                            self.table_modified = true;
-                            self.after_signal_write(id);
                         }
                     }
                 }

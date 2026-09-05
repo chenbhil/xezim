@@ -1953,9 +1953,7 @@ mod enabled {
             BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let idx = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*idx_reg as usize], 0);
+                let idx = dyn_bit_index_or_oob(builder, pointer_type, regs, xz, *idx_reg);
                 // A 1-bit write at [idx:idx] — same semantics, same bridge.
                 builder
                     .ins()
@@ -2099,9 +2097,7 @@ mod enabled {
             NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let idx = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*idx_reg as usize], 0);
+                let idx = dyn_bit_index_or_oob(builder, pointer_type, regs, xz, *idx_reg);
                 builder.ins().call(nba_bit_ref, &[sim_ptr, id, idx, v, x]);
             }
             // NbaAssignRangeDyn / NbaAssignBitDyn still left out — they
@@ -2908,6 +2904,26 @@ mod enabled {
     }
 
     /// Load both planes of a VM register.
+    /// §11.5.1: the index operand of a dynamic bit-store, with an x/z index
+    /// turned into a deliberately OUT-OF-RANGE one. The store bridges already
+    /// drop an out-of-range index, so this makes "unknown index writes
+    /// nothing" fall out of the path that is already there. The x plane never
+    /// reached the bridge, and the value plane has x bits masked to zero, so
+    /// an unknown index arrived as a perfectly ordinary bit 0.
+    fn dyn_bit_index_or_oob(
+        builder: &mut FunctionBuilder,
+        pointer_type: Type,
+        regs: &[StackSlot],
+        xz: &[StackSlot],
+        r: u16,
+    ) -> Value {
+        let (iv, ix) = ld2(builder, pointer_type, regs, xz, r);
+        let zero = builder.ins().iconst(types::I64, 0);
+        let oob = builder.ins().iconst(types::I64, -1);
+        let unknown = builder.ins().icmp(IntCC::NotEqual, ix, zero);
+        builder.ins().select(unknown, oob, iv)
+    }
+
     fn ld2(
         builder: &mut FunctionBuilder,
         pointer_type: Type,

@@ -366,3 +366,5 @@ mod real_to_integral_local;
 mod system_function_result_width;
 #[path = "types/packed_member_select_name_collision.rs"]
 mod packed_member_select_name_collision;
+#[path = "types/bit_write_unknown_index_discarded.rs"]
+mod bit_write_unknown_index_discarded;
