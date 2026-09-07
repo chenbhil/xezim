@@ -29,6 +29,8 @@ mod array_element_declared_signedness;
 mod array_parameter;
 #[path = "types/param_array_struct_pattern_elems.rs"]
 mod param_array_struct_pattern_elems;
+#[path = "types/const_fn_sign_cast_in_child.rs"]
+mod const_fn_sign_cast_in_child;
 #[path = "types/array_query_multidim_packed.rs"]
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
