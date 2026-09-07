@@ -5,7 +5,7 @@
 //!   NBA region:     non-blocking assign updates
 //!   Reactive:       edge-triggered always_ff/always_latch blocks
 
-use super::elaborate::{AlwaysBlock, DpiImportSpec, ElaboratedModule, Signal};
+use super::elaborate::{AlwaysBlock, CollDimKind, DpiImportSpec, ElaboratedModule, Signal};
 use super::value::{LogicBit, Value};
 use crate::ast::decl::{
     AlwaysKind, ClassConstraint, ConstraintItem, ConstraintRange, CovergroupDeclaration,
@@ -50155,6 +50155,36 @@ impl Simulator {
 
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
+                //
+                // This is ahead of the N-D fixed-array arm on purpose. For a
+                // CLASS-PROPERTY array of collections (`int q[3][$]`) the
+                // OUTER shape is registered in the ordinary fixed-array maps
+                // too — `$size` and `foreach` need it — so the fixed-array arm
+                // would claim the write and land it on a scalar cell the read
+                // path never consults. `indexed_queue_base` answers only when
+                // the row really is a registered collection, so an ordinary
+                // N-D fixed array still falls through to the arm below.
+                if let Some(qn) = self.indexed_queue_base(expr) {
+                    self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
+                    let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    self.dollar_bound.pop();
+                    if k >= 0 && k as u64 >= self.get_queue_size(&qn) {
+                        self.set_queue_size(&qn, k as u64 + 1);
+                    }
+                    let elem = format!("{}[{}]", qn, k);
+                    let prev = self.get_signal_value_by_name(&elem);
+                    let changed = prev.as_ref() != Some(val);
+                    self.set_signal_value_by_name(&elem, val.clone());
+                    return changed;
+                }
+                // `a[i][key] = v` on an array of associative arrays — same
+                // ordering rationale as the queue arm just above.
+                if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+                    let prev = self.get_signal_value_by_name(&elem);
+                    let changed = prev.as_ref() != Some(val);
+                    self.set_signal_value_by_name(&elem, val.clone());
+                    return changed;
+                }
                 // §7.4.2: a write to an N-D fixed-array class-property
                 // element lands in its per-instance cell, like the read.
                 if !self.no_class_objects() {
@@ -82221,12 +82251,17 @@ impl Simulator {
         if !matches!(base.kind, ExprKind::Index { .. }) {
             return None;
         }
-        let n = self.flat_member_name(base)?;
-        if self.module.dynamic_arrays.contains(&n) {
-            Some(n)
-        } else {
-            None
+        if let Some(n) = self.flat_member_name(base) {
+            if self.module.dynamic_arrays.contains(&n) {
+                return Some(n);
+            }
         }
+        // §7.4.5 CLASS-PROPERTY array of queues (`int q[3][$]`): the flat
+        // name is the unscoped `q[i]`, which is not the storage name — the
+        // row lives per-instance at `<h>#q[i]`. Resolving it here keeps every
+        // caller (element read AND element write) on one key by construction.
+        let row = self.coll_elem_expr_key(base)?;
+        self.module.dynamic_arrays.contains(&row).then_some(row)
     }
 
     /// `a[i]` naming an ELEMENT of an unpacked array of ASSOCIATIVE arrays
@@ -82235,12 +82270,18 @@ impl Simulator {
         if !matches!(base.kind, ExprKind::Index { .. }) {
             return None;
         }
-        let n = self.flat_member_name(base)?;
-        if self.module.associative_arrays.contains_key(&n) {
-            Some(n)
-        } else {
-            None
+        if let Some(n) = self.flat_member_name(base) {
+            if self.module.associative_arrays.contains_key(&n) {
+                return Some(n);
+            }
         }
+        // §7.4.5 CLASS-PROPERTY array of associative arrays — see
+        // `indexed_queue_base` for why the flat name is not enough.
+        let row = self.coll_elem_expr_key(base)?;
+        self.module
+            .associative_arrays
+            .contains_key(&row)
+            .then_some(row)
     }
 
     /// Flat storage name of `<assoc>[key]` for such an element.
@@ -94525,6 +94566,10 @@ impl Simulator {
                 .chain(cd.queue_properties.keys())
                 .chain(cd.array_properties.keys())
                 .chain(cd.array_nd_properties.keys())
+                // §7.4.5 `int q[3][$]` — also registered in the fixed-array
+                // maps above for its OUTER shape, so this chain link only
+                // matters for a shape that landed nowhere else.
+                .chain(cd.array_of_coll_properties.keys())
             {
                 map.entry(k.clone()).or_insert(None);
             }
@@ -94648,6 +94693,10 @@ impl Simulator {
                     if cd.assoc_properties.contains_key(member)
                         || cd.queue_properties.contains_key(member)
                         || cd.array_properties.contains_key(member)
+                        // §7.4.5 `int q[3][$]` — the BASE resolves like any
+                        // other collection property so `q[i]` can compose the
+                        // element key off it.
+                        || cd.array_of_coll_properties.contains_key(member)
                     {
                         return true;
                     }
@@ -96665,7 +96714,9 @@ impl Simulator {
                 // `m[i]` / `obj.m[i]`, which is not the storage name — resolve
                 // the instance-scoped row (`<h>#m[i]`) instead.
                 if let Some(row) = self.coll_elem_expr_key(expr) {
-                    if self.module.dynamic_arrays.contains(&row) {
+                    if self.module.dynamic_arrays.contains(&row)
+                        || self.module.associative_arrays.contains_key(&row)
+                    {
                         if let Some(res) = self.eval_builtin_method(&row, mname, args) {
                             return res;
                         }
@@ -104370,6 +104421,82 @@ impl Simulator {
                     }
                 }
             }
+            // §7.4.5 per-instance fixed array whose ELEMENT is a collection
+            // (`int q[3][$]`, `int d[3][]`, `int a[2][2][int]`). Two things
+            // are needed and only the first used to happen anywhere: the
+            // OUTER shape, so `$size(q)` and `foreach (q[i])` resolve, and an
+            // independent collection store per ELEMENT — the same treatment
+            // `queue_properties` gives a bare queue property, one index
+            // deeper. Without the second, `q[i].push_back(x)` had nowhere to
+            // land and `q[i].size()` answered 0 forever.
+            for (prop, (shape, width, kind)) in &cdef.array_of_coll_properties {
+                let scoped = format!("{}#{}", handle, prop);
+                match shape.len() {
+                    0 => continue,
+                    1 => {
+                        self.module
+                            .arrays
+                            .insert(scoped.clone(), (shape[0].0, shape[0].1, *width));
+                    }
+                    2 => {
+                        self.module
+                            .arrays_2d
+                            .insert(scoped.clone(), (shape[0], shape[1], *width));
+                    }
+                    _ => {
+                        self.module
+                            .arrays_nd
+                            .insert(scoped.clone(), (shape.clone(), *width));
+                    }
+                }
+                let total: i64 = shape.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
+                if total <= 0 || total > 65536 {
+                    continue;
+                }
+                let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
+                'elems: loop {
+                    let mut key = scoped.clone();
+                    for i in &idx {
+                        key.push('[');
+                        key.push_str(&i.to_string());
+                        key.push(']');
+                    }
+                    match kind {
+                        CollDimKind::Queue(cap) => {
+                            self.module.dynamic_arrays.insert(key.clone());
+                            self.module.arrays.insert(key.clone(), (0, 63, *width));
+                            if let Some(m) = cap {
+                                self.module.queue_max_sizes.insert(key.clone(), *m);
+                            }
+                            self.set_queue_size(&key, 0);
+                        }
+                        CollDimKind::Dyn => {
+                            self.module.dynamic_arrays.insert(key.clone());
+                            self.module.arrays.insert(key.clone(), (0, 63, *width));
+                            self.set_queue_size(&key, 0);
+                        }
+                        CollDimKind::Assoc { string_key } => {
+                            self.module
+                                .associative_arrays
+                                .insert(key.clone(), *string_key);
+                        }
+                    }
+                    self.widths.insert(key, *width);
+                    // odometer over the outer shape
+                    let mut d = idx.len();
+                    loop {
+                        if d == 0 {
+                            break 'elems;
+                        }
+                        d -= 1;
+                        idx[d] += 1;
+                        if idx[d] <= shape[d].1 {
+                            break;
+                        }
+                        idx[d] = shape[d].0;
+                    }
+                }
+            }
         }
         // Record concrete bindings for the leaf class's TYPE parameters
         // (e.g. `T -> Base` for `Mk#(Base)`). A later unqualified `obj =
@@ -105592,9 +105719,20 @@ impl Simulator {
         };
         // Row of a 2-D dynamic array: the base is itself an element key.
         if let Some(row) = self.coll_elem_expr_key(base) {
+            let i = self.eval_expr(index).to_i64().unwrap_or(0);
+            let composed = format!("{}[{}]", row, i);
             if self.module.dynamic_arrays.contains(&row) {
-                let i = self.eval_expr(index).to_i64().unwrap_or(0);
-                return Some(format!("{}[{}]", row, i));
+                return Some(composed);
+            }
+            // §7.4.5 INTERMEDIATE index of a fixed array whose element is a
+            // collection (`q[i][j]` on `int q[2][2][$]`). The row itself is
+            // not a collection — only the fully indexed element is — so the
+            // dynamic-array test above rejects it. Ask about the composed key
+            // instead, which construction registered.
+            if self.module.dynamic_arrays.contains(&composed)
+                || self.module.associative_arrays.contains_key(&composed)
+            {
+                return Some(composed);
             }
             return None;
         }
