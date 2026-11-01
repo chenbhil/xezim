@@ -624,3 +624,5 @@ mod typedef_overlay_674;
 mod unit_subroutine_usage_675;
 #[path = "types/body_typedef_first_instance_680.rs"]
 mod body_typedef_first_instance_680;
+#[path = "types/type_param_array_queries.rs"]
+mod type_param_array_queries;
