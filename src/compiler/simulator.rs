@@ -5421,6 +5421,64 @@ fn vector_fragment_width(frag: &str) -> Option<u32> {
     u32::try_from(width).ok()
 }
 
+/// The vector type a class type-argument fragment with literal ranges
+/// spells (`logic [1:4]`, `bit signed [3:0][7:0]`), every range as written:
+/// the array queries (§20.7) need the bounds, not only
+/// `vector_fragment_width`'s product. None for any other fragment, and for a
+/// negative bound.
+fn vector_fragment_dt(frag: &str) -> Option<crate::ast::types::DataType> {
+    use crate::ast::types::{DataType, IntegerVectorType as V, PackedDimension, Signing};
+    let (kind, rest) = if let Some(r) = frag.strip_prefix("bit") {
+        (V::Bit, r)
+    } else if let Some(r) = frag.strip_prefix("logic") {
+        (V::Logic, r)
+    } else {
+        (V::Reg, frag.strip_prefix("reg")?)
+    };
+    let rest = rest.trim_start();
+    let (signing, rest) = if let Some(r) = rest.strip_prefix("unsigned") {
+        (Some(Signing::Unsigned), r)
+    } else if let Some(r) = rest.strip_prefix("signed") {
+        (Some(Signing::Signed), r)
+    } else {
+        (None, rest)
+    };
+    let rest = rest.trim();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let span = crate::ast::Span::dummy();
+    let num = |v: u64| {
+        Box::new(Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: v.to_string(),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            span,
+        ))
+    };
+    let mut dimensions = Vec::new();
+    for dim in rest.split(']').filter(|d| !d.trim().is_empty()) {
+        let inner = dim.trim().strip_prefix('[')?;
+        let (l, r) = inner.split_once(':')?;
+        let (l, r) = (l.trim().parse::<u64>().ok()?, r.trim().parse::<u64>().ok()?);
+        dimensions.push(PackedDimension::Range {
+            left: num(l),
+            right: num(r),
+            span,
+        });
+    }
+    Some(DataType::IntegerVector {
+        kind,
+        signing,
+        dimensions,
+        span,
+    })
+}
+
 /// Parse `<base>[<idx>]` and resolve via the compact 1D-array map.
 /// Free function so it can be shared between the `&self` resolver on
 /// Simulator and the `&[Value]`-borrowed `exec_insns_isolated` path that

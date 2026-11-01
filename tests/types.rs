@@ -629,3 +629,5 @@ mod body_typedef_first_instance_680;
 mod return_expr_context_width;
 #[path = "types/type_param_header_defaults.rs"]
 mod type_param_header_defaults;
+#[path = "types/class_type_param_array_queries.rs"]
+mod class_type_param_array_queries;

@@ -360,9 +360,12 @@ impl Simulator {
     /// unless the operand really names a type — a signal of the same name is
     /// the ordinary array-query operand and keeps the signal path.
     pub(super) fn type_query_operand(
-        &self,
+        &mut self,
         arg: &Expression,
     ) -> Option<super::elaborate::TypeQueryDims> {
+        if let Some(q) = self.class_type_param_query_operand(arg) {
+            return Some(q);
+        }
         if let ExprKind::TypeLiteral(dt) = &arg.kind {
             return Some(super::elaborate::type_query_dims_of(
                 dt,
@@ -397,6 +400,101 @@ impl Simulator {
             Some(&self.module.typedef_types),
             Some(&self.module.typedef_unpacked_dims),
         )
+    }
+
+    /// §8.25/§20.7: a type operand naming a TYPE PARAMETER of the active class
+    /// specialization (`$left(T)` in `C#(logic [1:4])`): the dimensions of the
+    /// type it binds. A default in force is taken from its declared AST, so
+    /// it keeps its range and sizes from the class's value parameters; an
+    /// explicit binding from the bound type. `$bits(T)` resolves the same
+    /// binding (`bound_type_param_width`); the queries never looked, so `T`
+    /// fell through to the signal path and read 0. None for anything else.
+    fn class_type_param_query_operand(
+        &mut self,
+        arg: &Expression,
+    ) -> Option<super::elaborate::TypeQueryDims> {
+        use crate::ast::types::{DataType, TypeName};
+        let dt = match &arg.kind {
+            ExprKind::TypeLiteral(dt) => (**dt).clone(),
+            ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
+                DataType::TypeReference {
+                    name: TypeName {
+                        scopes: Vec::new(),
+                        name: hier.path[0].name.clone(),
+                        span: arg.span,
+                    },
+                    dimensions: Vec::new(),
+                    type_args: Vec::new(),
+                    span: arg.span,
+                }
+            }
+            _ => return None,
+        };
+        let DataType::TypeReference { name, .. } = &dt else {
+            return None;
+        };
+        if name.has_scope() {
+            return None;
+        }
+        let (base, _) = self.current_spec.as_ref()?;
+        let cd = self.module.classes.get(base)?;
+        if !cd.type_param_names.iter().any(|t| *t == name.name.name) {
+            return None;
+        }
+        // The class's value parameters size a default (`type T = logic
+        // [W-1:0]`): the active specialization's, as for `$bits(T)`, else
+        // the object's own. Not the object's first: a static call
+        // (`C#()::f()`) keeps the caller's `this`, another object.
+        let params = match self.params_with_class_spec() {
+            Some(p) => p,
+            None => match self.this_stack.last().copied().flatten() {
+                Some(h) => self.instance_param_scope(h),
+                None => self.module.parameters.clone(),
+            },
+        };
+        let DataType::TypeReference { dimensions, .. } = &dt else {
+            return None;
+        };
+        // An explicit binding is the specialization's argument text. A vector
+        // keeps its written ranges there (`logic [1:4]`), which
+        // `bind_type_params_in` reduces to `[w-1:0]`; that is all `$bits`
+        // needs, not the queries.
+        let bound = match self.class_type_param_default(&dt) {
+            Some(d) => d,
+            None => match self.resolve_type_param_binding(&name.name.name) {
+                Some(b) if dimensions.is_empty() => match super::vector_fragment_dt(b.trim()) {
+                    Some(v) => v,
+                    None => self.bound_type_dt(b.trim())?,
+                },
+                _ => self.bind_type_params_in(&dt, &|n| self.resolve_type_param_binding(n))?,
+            },
+        };
+        // A typedef binding (`C#(ua_t)`) by name, so its unpacked dimensions
+        // (`typedef logic [3:0] ua_t [0:2]`) count.
+        if let DataType::TypeReference {
+            name: tn,
+            dimensions: d,
+            ..
+        } = &bound
+        {
+            if d.is_empty() && !tn.has_scope() {
+                if let Some(q) = super::elaborate::type_query_dims_by_name(
+                    &tn.name.name,
+                    Some(&params),
+                    Some(&self.module.typedefs),
+                    Some(&self.module.typedef_types),
+                    Some(&self.module.typedef_unpacked_dims),
+                ) {
+                    return Some(q);
+                }
+            }
+        }
+        Some(super::elaborate::type_query_dims_of(
+            &bound,
+            Some(&params),
+            Some(&self.module.typedefs),
+            Some(&self.module.typedef_types),
+        ))
     }
 
     /// A `foreach` index variable is implicitly `int` (signed, §12.7.3), so a
